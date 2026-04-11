@@ -1,0 +1,116 @@
+name: Cloudflared Magisk
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout cloudflared
+        uses: actions/checkout@v4
+        with:
+          repository: cloudflare/cloudflared
+          fetch-depth: 0
+
+      - name: Set up Go 1.26
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+
+      - name: Compile Static Binary
+        run: |
+          echo "正在编译 Android ARM64 静态二进制文件..."
+          GOOS=android GOARCH=arm64 CGO_ENABLED=0 \
+          go build -v -ldflags="-s -w" -o cloudflared ./cmd/cloudflared
+
+      - name: Assemble Magisk Module
+        run: |
+          MOD_PATH="module"
+          mkdir -p $MOD_PATH
+
+          # 1. 直接把二进制文件放在模块根目录
+          mv cloudflared $MOD_PATH/
+          chmod 755 $MOD_PATH/cloudflared
+
+          # 2. 生成 module.prop
+          cat <<EOF > $MOD_PATH/module.prop
+          id=cloudflared
+          name=Cloudflared Magisk
+          version=v$(date +%Y.%m.%d)
+          versionCode=$(date +%Y%m%d)
+          author=GitHub_Action
+          description=Cloudflare Tunnel 模块
+          EOF
+
+          # 3. 生成内置配置文件
+          cat <<EOF > $MOD_PATH/settings.conf
+          # 是否开机自启动 (1 为开启, 0 为关闭)
+          AUTO_START=0
+          
+          # 你的 Cloudflare Tunnel Token
+          TOKEN=""
+          EOF
+
+          # 4. 生成启动脚本 (start.sh)
+          cat << 'EOF' > $MOD_PATH/start.sh
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          CONF="$MODDIR/settings.conf"
+          LOG="$MODDIR/run.log"
+          BIN="$MODDIR/cloudflared"
+
+          [ ! -f "$CONF" ] && exit 1
+          . "$CONF"
+
+          if [ -z "$TOKEN" ]; then
+              echo "$(date): Error - TOKEN 未填写" >> "$LOG"
+              exit 1
+          fi
+
+          if pgrep -x "cloudflared" > /dev/null; then
+              echo "cloudflared 已经在运行中"
+              exit 0
+          fi
+
+          # 动态获取手机当前时区，强制程序的日志输出为本地时间
+          export TZ=$(getprop persist.sys.timezone)
+
+          # 启动：直接指定 DNS
+          nohup "$BIN" tunnel run --dns-resolver-addrs 1.1.1.1:53 --token "$TOKEN" > "$LOG" 2>&1 &
+          
+          echo "cloudflared 已尝试启动，请查看 run.log"
+          EOF
+
+          # 5. 生成停止脚本 (stop.sh)
+          cat << 'EOF' > $MOD_PATH/stop.sh
+          #!/system/bin/sh
+          killall cloudflared
+          echo "cloudflared 已停止"
+          EOF
+
+          # 6. 生成面具开机自启入口 (service.sh)
+          cat << 'EOF' > $MOD_PATH/service.sh
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          CONF="$MODDIR/settings.conf"
+
+          until [ "$(getprop sys.boot_completed)" = "1" ]; do sleep 5; done
+
+          if [ -f "$CONF" ]; then
+              . "$CONF"
+              [ "$AUTO_START" = "1" ] && sh "$MODDIR/start.sh"
+          fi
+          EOF
+
+          chmod 755 $MOD_PATH/*.sh
+
+      - name: Zip Magisk Module
+        run: |
+          cd module && zip -r ../cloudflared-magisk.zip ./*
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cloudflared-Magisk-Module
+          path: cloudflared-magisk.zip
