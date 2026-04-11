@@ -39,7 +39,7 @@ jobs:
           name=Cloudflared Magisk
           version=v$(date +%Y.%m.%d)
           versionCode=$(date +%Y%m%d)
-          author=GitHub_Action
+          author=coolcat
           description=Cloudflare Tunnel 模块
           EOF
 
