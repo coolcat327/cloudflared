@@ -1,0 +1,134 @@
+name: Cloudflared Magisk
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout cloudflared
+        uses: actions/checkout@v4
+        with:
+          repository: cloudflare/cloudflared
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+
+      # ✅ 安装 Android NDK（关键）
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+
+      # ✅ CGO 编译 Android 二进制
+      - name: Build cloudflared (Android ARM64 CGO)
+        run: |
+          echo "编译 Android ARM64 (CGO enabled)..."
+
+          export ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME
+          export TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64
+          export TARGET=aarch64-linux-android
+
+          export CC=$TOOLCHAIN/bin/${TARGET}21-clang
+          export CXX=$TOOLCHAIN/bin/${TARGET}21-clang++
+
+          GOOS=android GOARCH=arm64 CGO_ENABLED=1 \
+          go build -v -ldflags="-s -w" -o cloudflared ./cmd/cloudflared
+
+          file cloudflared
+
+      # ✅ 打包 Magisk 模块
+      - name: Assemble Magisk Module
+        run: |
+          MOD_PATH="module"
+          mkdir -p $MOD_PATH
+
+          # 二进制
+          mv cloudflared $MOD_PATH/
+          chmod 755 $MOD_PATH/cloudflared
+
+          # module.prop
+          cat <<EOF > $MOD_PATH/module.prop
+          id=cloudflared
+          name=Cloudflared Magisk (CGO DNS FIX)
+          version=v$(date +%Y.%m.%d)
+          versionCode=$(date +%Y%m%d)
+          author=coolcat
+          description=Cloudflare Tunnel 模块
+          EOF
+
+          # 配置
+          cat <<EOF > $MOD_PATH/settings.conf
+          AUTO_START=0
+          TOKEN=""
+          EOF
+
+          # 启动脚本
+          cat << 'EOF' > $MOD_PATH/start.sh
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          CONF="$MODDIR/settings.conf"
+          LOG="$MODDIR/run.log"
+          BIN="$MODDIR/cloudflared"
+
+          [ ! -f "$CONF" ] && exit 1
+          . "$CONF"
+
+          if [ -z "$TOKEN" ]; then
+              echo "$(date): TOKEN 未填写" >> "$LOG"
+              exit 1
+          fi
+
+          if pgrep -x "cloudflared" > /dev/null; then
+              echo "cloudflared 已运行" >> "$LOG"
+              exit 0
+          fi
+
+          export TZ=$(getprop persist.sys.timezone)
+
+          # ✅ 核心：强制使用 Android 系统 DNS
+          export GODEBUG=netdns=cgo
+
+          # ✅ 避免 Android UDP / IPv6 坑
+          nohup "$BIN" tunnel run \
+            --protocol http2 \
+            --token "$TOKEN" \
+            > "$LOG" 2>&1 &
+
+          echo "$(date): cloudflared 启动完成" >> "$LOG"
+          EOF
+
+          # 停止脚本
+          cat << 'EOF' > $MOD_PATH/stop.sh
+          #!/system/bin/sh
+          pkill cloudflared
+          echo "cloudflared 已停止"
+          EOF
+
+          # 开机自启
+          cat << 'EOF' > $MOD_PATH/service.sh
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          CONF="$MODDIR/settings.conf"
+
+          until [ "$(getprop sys.boot_completed)" = "1" ]; do sleep 5; done
+
+          if [ -f "$CONF" ]; then
+              . "$CONF"
+              [ "$AUTO_START" = "1" ] && sh "$MODDIR/start.sh"
+          fi
+          EOF
+
+          chmod 755 $MOD_PATH/*.sh
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudflared-magisk
+          path: module/
+          include-hidden-files: true
