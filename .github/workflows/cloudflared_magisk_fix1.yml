@@ -1,4 +1,4 @@
-name: Cloudflared Magisk
+name: Cloudflared Magisk Fix1
 
 on:
   workflow_dispatch:
