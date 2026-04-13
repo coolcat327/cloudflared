@@ -1,4 +1,4 @@
-name: Cloudflared Magisk Fix1
+name: Cloudflared Magisk
 
 on:
   workflow_dispatch:
@@ -6,7 +6,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout cloudflared
         uses: actions/checkout@v4
@@ -14,61 +13,73 @@ jobs:
           repository: cloudflare/cloudflared
           fetch-depth: 0
 
-      - name: Set up Go
+      - name: Set up Go 1.26
         uses: actions/setup-go@v5
         with:
           go-version: '1.26.x'
 
-      # ✅ 安装 Android NDK（关键）
-      - name: Setup Android NDK
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r26d
-
-      # ✅ CGO 编译 Android 二进制
-      - name: Build cloudflared (Android ARM64 CGO)
+      - name: Compile Static Binary
         run: |
-          echo "编译 Android ARM64 (CGO enabled)..."
+          echo "正在注入硬编码 DNS 劫持代码..."
+          
+          # 在官方的 cmd/cloudflared 目录下新建 dns_hack.go 文件
+          # Go 语言编译时会自动将其和官方的 main.go 编译在一起
+          cat << 'EOF' > cmd/cloudflared/dns_hack.go
+          package main
 
-          export ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME
-          export TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64
-          export TARGET=aarch64-linux-android
+          import (
+              "context"
+              "net"
+          )
 
-          export CC=$TOOLCHAIN/bin/${TARGET}21-clang
-          export CXX=$TOOLCHAIN/bin/${TARGET}21-clang++
-
-          GOOS=android GOARCH=arm64 CGO_ENABLED=1 \
+          // init 函数会在 main 函数之前自动执行
+          func init() {
+              // 强行覆盖全局的默认 DNS 解析器
+              net.DefaultResolver = &net.Resolver{
+                  PreferGo: true,
+                  Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+                      d := net.Dialer{}
+                      // 将所有底层的 DNS 查询强行路由到 1.1.1.1 的 53 端口
+                      return d.DialContext(ctx, "udp", "1.1.1.1:53")
+                  },
+              }
+          }
+          EOF
+          
+          echo "正在编译 Android ARM64 静态二进制文件..."
+          # 禁用 CGO，减小体积，适配全平台安卓
+          GOOS=android GOARCH=arm64 CGO_ENABLED=0 \
           go build -v -ldflags="-s -w" -o cloudflared ./cmd/cloudflared
 
-          file cloudflared
-
-      # ✅ 打包 Magisk 模块
       - name: Assemble Magisk Module
         run: |
           MOD_PATH="module"
           mkdir -p $MOD_PATH
 
-          # 二进制
+          # 1. 直接把二进制文件放在模块根目录
           mv cloudflared $MOD_PATH/
           chmod 755 $MOD_PATH/cloudflared
 
-          # module.prop
+          # 2. 生成 module.prop
           cat <<EOF > $MOD_PATH/module.prop
           id=cloudflared
-          name=Cloudflared Magisk (CGO DNS FIX)
+          name=Cloudflared Magisk
           version=v$(date +%Y.%m.%d)
           versionCode=$(date +%Y%m%d)
           author=coolcat
           description=Cloudflare Tunnel 模块
           EOF
 
-          # 配置
+          # 3. 生成内置配置文件
           cat <<EOF > $MOD_PATH/settings.conf
+          # 是否开机自启动 (1 为开启, 0 为关闭)
           AUTO_START=0
+          
+          # 你的 Cloudflare Tunnel Token
           TOKEN=""
           EOF
 
-          # 启动脚本
+          # 4. 生成启动脚本 (start.sh)
           cat << 'EOF' > $MOD_PATH/start.sh
           #!/system/bin/sh
           MODDIR=${0%/*}
@@ -80,37 +91,32 @@ jobs:
           . "$CONF"
 
           if [ -z "$TOKEN" ]; then
-              echo "$(date): TOKEN 未填写" >> "$LOG"
+              echo "$(date): Error - TOKEN 未填写" >> "$LOG"
               exit 1
           fi
 
           if pgrep -x "cloudflared" > /dev/null; then
-              echo "cloudflared 已运行" >> "$LOG"
+              echo "cloudflared 已经在运行中"
               exit 0
           fi
 
+          # 动态获取手机当前时区，强制程序的日志输出为本地时间
           export TZ=$(getprop persist.sys.timezone)
 
-          # ✅ 核心：强制使用 Android 系统 DNS
-          export GODEBUG=netdns=cgo
-
-          # ✅ 避免 Android UDP / IPv6 坑
-          nohup "$BIN" tunnel run \
-            --protocol http2 \
-            --token "$TOKEN" \
-            > "$LOG" 2>&1 &
-
-          echo "$(date): cloudflared 启动完成" >> "$LOG"
+          # 启动：Go 源码底层已锁死 DNS，同时附加命令行参数做双重保险
+          nohup "$BIN" tunnel run --dns-resolver-addrs 1.1.1.1:53 --token "$TOKEN" > "$LOG" 2>&1 &
+          
+          echo "cloudflared 已尝试启动，请查看 run.log"
           EOF
 
-          # 停止脚本
+          # 5. 生成停止脚本 (stop.sh)
           cat << 'EOF' > $MOD_PATH/stop.sh
           #!/system/bin/sh
-          pkill cloudflared
+          killall cloudflared
           echo "cloudflared 已停止"
           EOF
 
-          # 开机自启
+          # 6. 生成面具开机自启入口 (service.sh)
           cat << 'EOF' > $MOD_PATH/service.sh
           #!/system/bin/sh
           MODDIR=${0%/*}
@@ -129,6 +135,9 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
+          # 下载后的压缩包名字 (不用加 .zip，GitHub 会自动加)
           name: cloudflared-magisk
+          # 直接把整理好的 module 文件夹丢给它去压缩
           path: module/
+          # 隐藏多余的层级结构，确保文件都在压缩包根目录
           include-hidden-files: true
